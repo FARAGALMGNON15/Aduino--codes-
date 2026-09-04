@@ -1,1 +1,1713 @@
-code
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <string.h>
+#include <math.h>
+
+// =====================================================================
+// TFT DISPLAY
+// =====================================================================
+#define TFT_CS    10
+#define TFT_RST   9
+#define TFT_DC    8
+#define FRAME_TIME 20
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+GFXcanvas16 canvas(128, 128);
+
+// =====================================================================
+// INPUT
+// =====================================================================
+const int btn4 = 4;      // B4: Play / Select
+const int btn5 = 5;      // B5: Back to Welcome / Exit
+const int btn6 = 6;      // B6: Info / Restart
+const int btnLeft = 7;
+
+const int joyX = 1;
+const int joyY = 2;
+const int joySW = 3;
+
+// =====================================================================
+// OUTPUT
+// =====================================================================
+const int led1 = 42;
+const int led2 = 21;
+const int buzzerPin = 13;
+
+void playBuzzer(int frequency, int duration) {
+  #if defined(ESP32)
+    ledcAttach(buzzerPin, frequency, 8);
+    ledcWriteTone(buzzerPin, frequency);
+    delay(duration);
+    ledcWriteTone(buzzerPin, 0);
+  #else
+    tone(buzzerPin, frequency, duration);
+    delay(duration);
+  #endif
+}
+
+// =====================================================================
+// PALETTE & COLORS (ألوان خفيفة ولطيفة بدون أخضر)
+// =====================================================================
+#define DINO_BG          0x0841   // خلفية داكنة مائلة للزرقة الهادئة
+#define MENU_BOX_BG      0x18E3   // لون خفيف ولطيف للإطار غير المحدد
+#define MENU_SEL_BG      0x02F5   // لون مميز وخفيف لتحديد اللعبة (بروز PS4)
+#define MENU_TEXT_DIM    0xCE79   // نص هادئ غير فاقع
+#define PANEL_LINE       0x39C4
+#define LIGHT_BLUE       0x867F   
+#define WHITE_DIM        0xC618
+#define DINO_FG          ST7735_WHITE
+#define DINO_RED         ST7735_RED
+
+// =====================================================================
+// STATE MACHINE
+// =====================================================================
+enum SystemState {
+  STATE_WELCOME,
+  STATE_JOYSTICK_TUTORIAL,
+  STATE_MENU,
+  STATE_GAME_INFO,
+  STATE_DINO_START,
+  STATE_DINO_COUNTDOWN,
+  STATE_DINO_PLAYING,
+  STATE_FLAPPY_START,
+  STATE_FLAPPY_COUNTDOWN,
+  STATE_FLAPPY_PLAYING,
+  STATE_TIME_START,
+  STATE_TIME_PLAYING,
+  STATE_CONFIRM_EXIT,
+  STATE_GAMEOVER
+};
+SystemState currentState = STATE_WELCOME;
+
+// =====================================================================
+// MENU VARIABLES
+// =====================================================================
+const char* gamesList[] = {
+  "Dino Run",
+  "Flappy Bird",
+  "Time Game",
+  "Celeste",
+  "Hades",
+  "Super Mario",
+  "Super Smash",
+  "Stardew"
+};
+
+const char* gamesDesc1[] = {
+  "Run & jump over",
+  "Tap B4 to fly",
+  "Stop the clock",
+  "Precision platform",
+  "Escape the",
+  "Classic platform",
+  "Platform fighter",
+  "Relaxing farming"
+};
+
+const char* gamesDesc2[] = {
+  "obstacles!",
+  "through pipes.",
+  "at the right time!",
+  "climbing game.",
+  "underworld.",
+  "adventure.",
+  "showdown.",
+  "simulation."
+};
+
+const int totalGames = 8;
+int currentGameIndex = 0;
+float menuVisualPos = 0.0;
+
+bool focusAnimActive = false;
+unsigned long focusAnimTimer = 0;
+float focusProgress = 0.0;
+
+unsigned long tutorialAnimTimer = 0;
+
+// =====================================================================
+// DINO GAME VARIABLES
+// =====================================================================
+float dinoX = 16;
+float dinoY = 85;
+float dinoVY = 0;
+bool dinoIsJumping = false;
+
+int dinoScore = 0;
+int dinoHighScore = 0;
+float dinoGameSpeed = 2.0;
+
+struct Obstacle {
+  float x;
+  int y;
+  int w;
+  int h;
+  bool isBird;
+  bool active;
+};
+
+#define NUM_OBS 2
+Obstacle obstacles[NUM_OBS];
+
+struct CloudPos { int x, y; };
+CloudPos clouds[3] = {
+  {15, 15}, {65, 25}, {110, 12}
+};
+
+// =====================================================================
+// FLAPPY BIRD VARIABLES
+// =====================================================================
+float birdY = 64;
+float birdVY = 0;
+int flappyScore = 0;
+int flappyHighScore = 0;
+float pipeX = 128;
+int pipeGapY = 50;
+const int pipeWidth = 14;
+const int pipeGapHeight = 52;
+float flappySpeed = 1.4;
+
+// =====================================================================
+// TIME GAME VARIABLES
+// =====================================================================
+float timeTarget = 5.0;
+unsigned long timeRoundStart = 0;
+float timeCycleSeconds = 4.0;
+int timeRoundCount = 0;
+int timeGameScore = 0;
+int timeGameHighScore = 0;
+bool timeRoundRunning = false;
+bool timeWaitingRelease = true;
+bool timeShowingResult = false;
+unsigned long timeResultShownAt = 0;
+float timeFrozenValue = 0;
+float timeLastDiff = 0;
+int timeLastScore = 0;
+char timeResultText[16] = "";
+
+// =====================================================================
+// MISC / TIMERS
+// =====================================================================
+bool exitChoice = false;
+unsigned long lastFrame = 0;
+unsigned long lastNavTime = 0;
+
+unsigned long countdownTimer = 0;
+int countdownStep = 3;
+
+unsigned long welcomeAnimTimer = 0;
+bool waitingForButtonRelease = true;
+int welcomeSoundStep = 0;
+
+unsigned long aggroTime = 0;
+
+// =====================================================================
+// PROTOTYPES
+// =====================================================================
+void drawWelcomeScreen();
+void drawEmber(int x, int y, uint16_t coreColor, unsigned long t);
+unsigned long typedMessageDuration(const char* msg, unsigned long typeMs, unsigned long holdMs, unsigned long eraseMs);
+void drawTypedMessage(const char* msg, int y, unsigned long elapsedInPhase,
+                       unsigned long typeMs, unsigned long holdMs, unsigned long eraseMs,
+                       uint16_t color);
+void handleWelcomeState();
+void drawTransparentJoystickTutorial();
+void handleJoystickTutorialState();
+void drawGameMenuContent();
+void drawGameMenu();
+void handleMenuState();
+void drawGameInfoScreen();
+void handleGameInfoState();
+void drawDinoStartScreen();
+void handleDinoStartState();
+void drawFlappyStartScreen();
+void handleFlappyStartState();
+void drawCountdownScreen(int num);
+void handleDinoCountdownState();
+void handleFlappyCountdownState();
+void resetDinoGame();
+void resetFlappyGame();
+void handleDinoPlayingState();
+void handleFlappyPlayingState();
+void drawDinoGame();
+void drawFlappyGame();
+void drawDino(int x, int y);
+void drawFlappyBird(int x, int y);
+void drawCactus(int x, int y, int w, int h);
+void drawBird(int x, int y);
+void triggerGameOver();
+void drawGameOverScreen();
+void handleGameOverState();
+void drawConfirmExitScreen();
+void drawChoiceButton(int x, int y, const char* label, bool selected);
+void handleConfirmExitState();
+void pushCanvas();
+
+void resetTimeGame();
+void startNewTimeRound();
+void drawTimeStartScreen();
+void handleTimeStartState();
+void handleTimePlayingState();
+void drawTimeGame(float currentValue);
+
+// =====================================================================
+// SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(btn4, INPUT_PULLUP);
+  pinMode(btn5, INPUT_PULLUP);
+  pinMode(btn6, INPUT_PULLUP);
+  pinMode(btnLeft, INPUT_PULLUP);
+  pinMode(joySW, INPUT_PULLUP);
+
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(led1, LOW);
+  digitalWrite(led2, LOW);
+
+  SPI.begin(12, -1, 11, 10);
+  tft.initR(INITR_144GREENTAB);
+  tft.setRotation(0);
+  tft.fillScreen(ST7735_BLACK);
+
+  welcomeAnimTimer = millis();
+  welcomeSoundStep = 0;
+  drawWelcomeScreen();
+}
+
+// =====================================================================
+// MAIN LOOP
+// =====================================================================
+void loop() {
+  switch (currentState) {
+    case STATE_WELCOME:           handleWelcomeState();           break;
+    case STATE_JOYSTICK_TUTORIAL: handleJoystickTutorialState(); break;
+    case STATE_MENU:              handleMenuState();              break;
+    case STATE_GAME_INFO:         handleGameInfoState();          break;
+    case STATE_DINO_START:        handleDinoStartState();         break;
+    case STATE_DINO_COUNTDOWN:    handleDinoCountdownState();     break;
+    case STATE_DINO_PLAYING:      handleDinoPlayingState();       break;
+    case STATE_FLAPPY_START:      handleFlappyStartState();       break;
+    case STATE_FLAPPY_COUNTDOWN:  handleFlappyCountdownState();   break;
+    case STATE_FLAPPY_PLAYING:    handleFlappyPlayingState();     break;
+    case STATE_TIME_START:        handleTimeStartState();         break;
+    case STATE_TIME_PLAYING:      handleTimePlayingState();       break;
+    case STATE_CONFIRM_EXIT:      handleConfirmExitState();       break;
+    case STATE_GAMEOVER:          handleGameOverState();          break;
+  }
+}
+
+void pushCanvas() {
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 128, 128);
+}
+
+// =====================================================================
+// WELCOME SCREEN
+// =====================================================================
+void drawEmber(int x, int y, uint16_t coreColor, unsigned long t) {
+  canvas.fillCircle(x, y, 4, ST7735_YELLOW);
+  canvas.fillCircle(x, y, 2, coreColor);
+  if ((t / 60) % 3 == 0) {
+    canvas.drawPixel(x + (((t / 30) % 2) ? 3 : -3), y - 3, ST7735_YELLOW);
+  }
+}
+
+unsigned long typedMessageDuration(const char* msg, unsigned long typeMs, unsigned long holdMs, unsigned long eraseMs) {
+  unsigned long len = strlen(msg);
+  return (len * typeMs) + holdMs + (len * eraseMs);
+}
+
+void drawTypedMessage(const char* msg, int y, unsigned long elapsedInPhase,
+                       unsigned long typeMs, unsigned long holdMs, unsigned long eraseMs,
+                       uint16_t color) {
+  int len = strlen(msg);
+  unsigned long typeDur = (unsigned long)len * typeMs;
+  unsigned long holdEnd = typeDur + holdMs;
+  unsigned long totalDur = holdEnd + ((unsigned long)len * eraseMs);
+
+  int visibleChars;
+  if (elapsedInPhase < typeDur) {
+    visibleChars = elapsedInPhase / typeMs;
+  } else if (elapsedInPhase < holdEnd) {
+    visibleChars = len;
+  } else if (elapsedInPhase < totalDur) {
+    unsigned long eraseElapsed = elapsedInPhase - holdEnd;
+    int erased = eraseElapsed / eraseMs;
+    visibleChars = len - erased;
+  } else {
+    visibleChars = 0;
+  }
+
+  if (visibleChars < 0) visibleChars = 0;
+  if (visibleChars > len) visibleChars = len;
+  if (visibleChars == 0) return;
+
+  char buf[32];
+  int n = (visibleChars < 31) ? visibleChars : 31;
+  strncpy(buf, msg, n);
+  buf[n] = '\0';
+
+  int textX = 64 - (len * 6) / 2;
+  canvas.setTextSize(1);
+  canvas.setTextColor(color);
+  canvas.setCursor(textX, y);
+  canvas.print(buf);
+
+  if (visibleChars < len) {
+    if ((elapsedInPhase / 200) % 2 == 0) {
+      int cursorX = textX + visibleChars * 6;
+      canvas.drawFastVLine(cursorX, y, 8, color);
+    }
+  }
+}
+
+void drawWelcomeScreen() {
+  canvas.fillScreen(ST7735_BLACK);
+
+  unsigned long elapsed = millis() - welcomeAnimTimer;
+  float duration = 3600.0;
+  float p = (float)elapsed / duration;
+  if (p > 1.0) p = 1.0;
+
+  unsigned long idleTime = (p >= 1.0) ? (elapsed - 3600) : 0;
+  bool attractModeActive = (idleTime > 15000);
+
+  const unsigned long T_EMERGE  = 500;
+  const unsigned long T_TRAVEL1 = 900;
+  const unsigned long T_BURN1   = 2700;
+  const unsigned long T_TRAVEL2 = 3100;
+  const unsigned long T_BURN2   = 4900;
+
+  const unsigned long MSG_TYPE_MS  = 90;
+  const unsigned long MSG_HOLD_MS  = 700;
+  const unsigned long MSG_ERASE_MS = 45;
+  const char* attractMsg1 = "SCARED TO PLAY?";
+  const char* attractMsg2 = "WAKE UP, LAZY!";
+  const char* attractMsg3 = "PRESS B4 TO START";
+
+  unsigned long msg1Dur = typedMessageDuration(attractMsg1, MSG_TYPE_MS, MSG_HOLD_MS, MSG_ERASE_MS);
+  unsigned long msg2Dur = typedMessageDuration(attractMsg2, MSG_TYPE_MS, MSG_HOLD_MS, MSG_ERASE_MS);
+  unsigned long msg3Dur = ((unsigned long)strlen(attractMsg3) * MSG_TYPE_MS) + 2200;
+
+  unsigned long T_MSG1_END = T_BURN2    + msg1Dur;
+  unsigned long T_MSG2_END = T_MSG1_END + msg2Dur;
+  unsigned long T_MSG3_END = T_MSG2_END + msg3Dur;
+
+  if (attractModeActive) aggroTime = idleTime - 15000;
+
+  bool welcomeBurnt  = attractModeActive && aggroTime >= T_BURN1;
+  bool nintendoBurnt = attractModeActive && aggroTime >= T_BURN2;
+
+  if (idleTime > 0) {
+    for (int i = 0; i < 15; i++) {
+      int sx = 8 + (i * 137) % 112;
+      int sy = ( (i * 93) + (idleTime / (20 + (i % 3) * 10)) ) % 128;
+
+      if (sx > 4 && sx < 124 && sy > 4 && sy < 124) {
+         canvas.drawPixel(sx, sy, (i % 2 == 0) ? ST7735_CYAN : 0x4208);
+      }
+    }
+  }
+
+  int bw = 3;
+  canvas.fillRect(0, 0, 64, bw, ST7735_RED);
+  canvas.fillRect(0, 128 - bw, 64, bw, ST7735_RED);
+  canvas.fillRect(0, 0, bw, 128, ST7735_RED);
+
+  canvas.fillRect(64, 0, 64, bw, ST7735_BLUE);
+  canvas.fillRect(64, 128 - bw, 64, bw, ST7735_BLUE);
+  canvas.fillRect(128 - bw, 0, bw, 128, ST7735_BLUE);
+
+  canvas.drawFastHLine(bw, bw, 64 - bw, ST7735_WHITE);
+  canvas.drawFastHLine(bw, 127 - bw, 64 - bw, ST7735_WHITE);
+  canvas.drawFastVLine(bw, bw, 128 - (2 * bw), ST7735_WHITE);
+
+  canvas.drawFastHLine(64, bw, 64 - bw, ST7735_CYAN);
+  canvas.drawFastHLine(64, 127 - bw, 64 - bw, ST7735_CYAN);
+  canvas.drawFastVLine(127 - bw, bw, 128 - (2 * bw), ST7735_CYAN);
+
+  if (elapsed >= 900 && welcomeSoundStep == 0) { playBuzzer(523, 30); welcomeSoundStep = 1; }
+  if (elapsed >= 1800 && welcomeSoundStep == 1) { playBuzzer(659, 30); welcomeSoundStep = 2; }
+  if (elapsed >= 2700 && welcomeSoundStep == 2) { playBuzzer(784, 30); welcomeSoundStep = 3; }
+  if (elapsed >= 3600 && welcomeSoundStep == 3) { playBuzzer(1760, 15); delay(15); playBuzzer(2637, 25); welcomeSoundStep = 4; }
+
+  float logoP = (p >= 0.25) ? 1.0 : (p / 0.25);
+  float easeLogo = 1.0 - (1.0 - logoP) * (1.0 - logoP);
+  int joyYOffset = -35 + (int)(easeLogo * 50.0);
+
+  int joyRedX = 42;
+  int joyBlueX = 66;
+
+  canvas.fillRoundRect(joyRedX, joyYOffset, 18, 30, 5, ST7735_RED);
+  canvas.fillRoundRect(joyBlueX, joyYOffset, 18, 30, 5, ST7735_BLUE);
+
+  int leftStickY = joyYOffset + 9;
+  int rightStickY = joyYOffset + 21;
+
+  canvas.fillCircle(joyRedX + 9, leftStickY, 3, ST7735_BLACK);
+  canvas.fillCircle(joyBlueX + 9, rightStickY, 3, ST7735_BLACK);
+
+  if (p > 0.25 && !welcomeBurnt) {
+    if (!attractModeActive) {
+      float text1P = (p >= 0.50) ? 1.0 : ((p - 0.25) / 0.25);
+      float easeText1 = 1.0 - (1.0 - text1P) * (1.0 - text1P);
+      int welcomeCurrentX = 128 - (int)(easeText1 * (128 - 22));
+
+      canvas.setTextSize(2);
+      canvas.setCursor(welcomeCurrentX, 52);
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("WEL");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("COME");
+    } else {
+      canvas.setTextSize(2);
+      canvas.setCursor(22, 52);
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("WEL");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("COME");
+    }
+  }
+
+  if (p > 0.50 && !nintendoBurnt) {
+    if (!attractModeActive) {
+      float text2P = (p >= 0.75) ? 1.0 : ((p - 0.50) / 0.25);
+      float easeText2 = 1.0 - (1.0 - text2P) * (1.0 - text2P);
+      int nsCurrentX = -100 + (int)(easeText2 * (18 - (-100)));
+
+      canvas.setTextSize(1);
+      canvas.setCursor(nsCurrentX, 75);
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("NINT");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("ENDO ");
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("SW");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("ITCH");
+    } else {
+      canvas.setTextSize(1);
+      canvas.setCursor(18, 75);
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("NINT");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("ENDO ");
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("SW");
+      canvas.setTextColor(ST7735_BLUE);
+      canvas.print("ITCH");
+    }
+  }
+
+  int boxCurrentY = 94;
+  if (p > 0.75) {
+    float startP = (p >= 1.0) ? 1.0 : ((p - 0.75) / 0.25);
+    float easeStart = 1.0 - (1.0 - startP) * (1.0 - startP);
+    boxCurrentY = 140 - (int)(easeStart * (140 - 94));
+
+    canvas.drawFastVLine(8, boxCurrentY, 18, ST7735_RED);
+    canvas.drawFastHLine(8, boxCurrentY, 56, ST7735_RED);
+    canvas.drawFastHLine(8, boxCurrentY + 17, 56, ST7735_RED);
+
+    canvas.drawFastVLine(120, boxCurrentY, 18, ST7735_BLUE);
+    canvas.drawFastHLine(64, boxCurrentY, 56, ST7735_BLUE);
+    canvas.drawFastHLine(64, boxCurrentY + 17, 56, ST7735_BLUE);
+
+    bool showText = true;
+    if (idleTime > 0 && !attractModeActive) {
+        showText = (idleTime % 1200) < 800;
+    }
+
+    if (showText && !attractModeActive) {
+        canvas.setTextSize(1);
+        canvas.setCursor(20, boxCurrentY + 5);
+        canvas.setTextColor(ST7735_RED);
+        canvas.print("PRESS ");
+        canvas.print("T");
+        canvas.setTextColor(ST7735_BLUE);
+        canvas.print("o");
+        canvas.setTextColor(ST7735_BLUE);
+        canvas.print(" START");
+    }
+  }
+
+  if (attractModeActive) {
+    canvas.drawFastVLine(8, 94, 18, ST7735_RED);
+    canvas.drawFastHLine(8, 94, 56, ST7735_RED);
+    canvas.drawFastHLine(8, 94 + 17, 56, ST7735_RED);
+
+    canvas.drawFastVLine(120, 94, 18, ST7735_BLUE);
+    canvas.drawFastHLine(64, 94, 56, ST7735_BLUE);
+    canvas.drawFastHLine(64, 94 + 17, 56, ST7735_BLUE);
+
+    if ((aggroTime / 500) % 2 == 0) {
+      canvas.setTextSize(1);
+      canvas.setCursor(20, 94 + 5);
+      canvas.setTextColor(ST7735_RED);
+      canvas.print("PRESS TO START");
+    }
+
+    if (aggroTime < T_EMERGE) {
+      float pe = (float)aggroTime / (float)T_EMERGE;
+      float easeE = pe * pe * (3.0 - 2.0 * pe);
+
+      int cx = 64, cy = 30;
+      int r = (int)(easeE * 4.0);
+
+      if (pe < 0.75) {
+        for (int i = 0; i < 6; i++) {
+          float ang = (i * 60) * 0.0174533;
+          int px = cx + (int)(cos(ang) * easeE * 10.0);
+          int py = cy + (int)(sin(ang) * easeE * 10.0);
+          canvas.drawPixel(px, py, (i % 2 == 0) ? ST7735_RED : ST7735_BLUE);
+        }
+      }
+
+      canvas.fillCircle(cx - 3, cy, r, ST7735_YELLOW);
+      canvas.fillCircle(cx - 3, cy, max(0, r - 2), ST7735_RED);
+      canvas.fillCircle(cx + 3, cy, r, ST7735_YELLOW);
+      canvas.fillCircle(cx + 3, cy, max(0, r - 2), ST7735_BLUE);
+
+      if (aggroTime < 40) { playBuzzer(1200, 30); }
+    }
+    else if (aggroTime < T_TRAVEL1) {
+      float pt = (float)(aggroTime - T_EMERGE) / (float)(T_TRAVEL1 - T_EMERGE);
+      float easeT = 1.0 - (1.0 - pt) * (1.0 - pt);
+
+      int dotY = 30 + (int)(easeT * (60 - 30));
+
+      if (((aggroTime - T_EMERGE) / 40) % 2 == 0) {
+        canvas.drawPixel(58 + random(0, 4), dotY - 4, ST7735_CYAN);
+        canvas.drawPixel(70 - random(0, 4), dotY - 4, ST7735_CYAN);
+      }
+
+      drawEmber(61, dotY, ST7735_RED, aggroTime);
+      drawEmber(67, dotY, ST7735_BLUE, aggroTime);
+    }
+    else if (aggroTime < T_BURN1) {
+      float pb = (float)(aggroTime - T_TRAVEL1) / (float)(T_BURN1 - T_TRAVEL1);
+      if (pb > 1.0) pb = 1.0;
+      float easeB = pb * pb * (3.0 - 2.0 * pb);
+
+      int redX  = 64 - (int)(easeB * (64 - 22));
+      int blueX = 64 + (int)(easeB * (106 - 64));
+      int dotY  = 60 + (int)(sin(aggroTime * 0.02) * 2.0);
+
+      canvas.fillRect(redX, 51, 64 - redX, 18, ST7735_BLACK);
+      canvas.fillRect(64, 51, blueX - 64, 18, ST7735_BLACK);
+
+      drawEmber(redX, dotY, ST7735_RED, aggroTime);
+      drawEmber(blueX, dotY, ST7735_BLUE, aggroTime);
+
+      if ((aggroTime - T_TRAVEL1) % 140 < 35) {
+        playBuzzer(random(300, 650), 18);
+      }
+    }
+    else if (aggroTime < T_TRAVEL2) {
+      float pt2 = (float)(aggroTime - T_BURN1) / (float)(T_TRAVEL2 - T_BURN1);
+      float easeT2 = 1.0 - (1.0 - pt2) * (1.0 - pt2);
+
+      int redX  = 22 + (int)(easeT2 * (64 - 22));
+      int blueX = 106 - (int)(easeT2 * (106 - 64));
+      int dotY  = 60 + (int)(easeT2 * (79 - 60));
+
+      drawEmber(redX, dotY, ST7735_RED, aggroTime);
+      drawEmber(blueX, dotY, ST7735_BLUE, aggroTime);
+    }
+    else if (aggroTime < T_BURN2) {
+      float pb2 = (float)(aggroTime - T_TRAVEL2) / (float)(T_BURN2 - T_TRAVEL2);
+      if (pb2 > 1.0) pb2 = 1.0;
+      float easeB2 = pb2 * pb2 * (3.0 - 2.0 * pb2);
+
+      int redX  = 64 - (int)(easeB2 * (64 - 18));
+      int blueX = 64 + (int)(easeB2 * (108 - 64));
+      int dotY  = 79 + (int)(sin(aggroTime * 0.02) * 1.5);
+
+      canvas.fillRect(redX, 74, 64 - redX, 10, ST7735_BLACK);
+      canvas.fillRect(64, 74, blueX - 64, 10, ST7735_BLACK);
+
+      drawEmber(redX, dotY, ST7735_RED, aggroTime);
+      drawEmber(blueX, dotY, ST7735_BLUE, aggroTime);
+
+      if ((aggroTime - T_TRAVEL2) % 140 < 35) {
+        playBuzzer(random(300, 650), 18);
+      }
+    }
+    else if (aggroTime < T_MSG1_END) {
+      unsigned long localT = aggroTime - T_BURN2;
+      drawTypedMessage(attractMsg1, 58, localT, MSG_TYPE_MS, MSG_HOLD_MS, MSG_ERASE_MS, ST7735_RED);
+      if (localT < (unsigned long)strlen(attractMsg1) * MSG_TYPE_MS && (localT % MSG_TYPE_MS) < 20) {
+        playBuzzer(1400, 15);
+      }
+    }
+    else if (aggroTime < T_MSG2_END) {
+      unsigned long localT = aggroTime - T_MSG1_END;
+      drawTypedMessage(attractMsg2, 58, localT, MSG_TYPE_MS, MSG_HOLD_MS, MSG_ERASE_MS, ST7735_WHITE);
+      if (localT < (unsigned long)strlen(attractMsg2) * MSG_TYPE_MS && (localT % MSG_TYPE_MS) < 20) {
+        playBuzzer(700, 20);
+      }
+    }
+    else if (aggroTime < T_MSG3_END) {
+      unsigned long localT = aggroTime - T_MSG2_END;
+      drawTypedMessage(attractMsg3, 58, localT, MSG_TYPE_MS, 2200, 0, ST7735_BLUE);
+      if (localT < (unsigned long)strlen(attractMsg3) * MSG_TYPE_MS && (localT % MSG_TYPE_MS) < 20) {
+        playBuzzer(1600, 15);
+      }
+    }
+    else {
+      unsigned long harasTime = aggroTime - T_MSG3_END;
+
+      if ((harasTime / 250) % 2 == 0) {
+        canvas.drawRect(2, 2, 124, 124, ST7735_RED);
+      } else {
+        canvas.drawRect(2, 2, 124, 124, ST7735_BLUE);
+      }
+
+      int shake = (harasTime / 100) % 2 == 0 ? 2 : -2;
+
+      int redDotX = 60 + shake;
+      int redDotY = 78;
+      int blueDotX = 68 - shake;
+      int blueDotY = 78;
+
+      canvas.fillCircle(redDotX, redDotY, 4, ST7735_RED);
+      canvas.fillCircle(blueDotX, blueDotY, 4, ST7735_BLUE);
+
+      if (harasTime % 1800 < 100) {
+        playBuzzer(2800, 45);
+        delay(25);
+        playBuzzer(3400, 45);
+      }
+    }
+  }
+
+  pushCanvas();
+}
+
+void handleWelcomeState() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - welcomeAnimTimer;
+
+  bool allButtonsReleased =
+    digitalRead(btn4) == HIGH && digitalRead(btn5) == HIGH &&
+    digitalRead(btn6) == HIGH && digitalRead(btnLeft) == HIGH &&
+    digitalRead(joySW) == HIGH;
+
+  int xVal = analogRead(joyX);
+  int yVal = analogRead(joyY);
+  bool joystickCentered = (xVal >= 1000 && xVal <= 3000 && yVal >= 1000 && yVal <= 3000);
+
+  if (waitingForButtonRelease) {
+    if (allButtonsReleased && joystickCentered) {
+      waitingForButtonRelease = false;
+    }
+    drawWelcomeScreen();
+    return;
+  }
+
+  if (elapsed >= 3600 && !waitingForButtonRelease) {
+    drawWelcomeScreen();
+
+    bool buttonPressed =
+      digitalRead(btn4) == LOW || digitalRead(btn5) == LOW ||
+      digitalRead(btn6) == LOW || digitalRead(btnLeft) == LOW ||
+      digitalRead(joySW) == LOW;
+
+    bool joystickMoved = xVal < 500 || xVal > 3500 || yVal < 500 || yVal > 3500;
+
+    if (buttonPressed || joystickMoved) {
+      digitalWrite(led1, HIGH);
+      digitalWrite(led2, HIGH);
+      playBuzzer(2500, 100);
+      delay(100);
+      digitalWrite(led1, LOW);
+      digitalWrite(led2, LOW);
+
+      currentState = STATE_JOYSTICK_TUTORIAL;
+      currentGameIndex = 0;
+      menuVisualPos = 0.0;
+      tutorialAnimTimer = millis();
+    }
+  } else {
+    drawWelcomeScreen();
+  }
+}
+
+// =====================================================================
+// GAME MENU CONTENT (مع تأثير البروز PS4 Style والألوان الهادئة)
+// =====================================================================
+void drawGameMenuContent() {
+  canvas.fillScreen(DINO_BG);
+
+  // --- الهيدر (العنوان العلوي) ---
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(8, 6);
+  canvas.print("GAMES LIST");
+  canvas.drawFastHLine(8, 16, 60, LIGHT_BLUE);
+
+  // --- البطارية الواضحة في أعلى اليمين ---
+  int batX = 98;
+  int batY = 5;
+  int batW = 20;
+  int batH = 10;
+  canvas.drawRect(batX, batY, batW, batH, ST7735_WHITE);
+  canvas.fillRect(batX + batW, batY + 2, 2, batH - 4, ST7735_WHITE);
+  canvas.fillRect(batX + 2, batY + 2, 13, batH - 4, LIGHT_BLUE);
+
+  // --- القائمة مع تأثير البروز والتكبير للعبة المحددة ---
+  int startY = 24;
+  int visibleItems = 5;
+
+  int topIndex = currentGameIndex - 2;
+  if (topIndex < 0) topIndex = 0;
+  if (topIndex > totalGames - visibleItems) topIndex = totalGames - visibleItems;
+
+  for (int i = 0; i < visibleItems; i++) {
+    int idx = topIndex + i;
+    if (idx >= totalGames) break;
+
+    bool selected = (idx == currentGameIndex);
+    int yPos = startY + (i * 18);
+
+    if (selected) {
+      int boxHeight = 16;
+      canvas.fillRoundRect(6, yPos - 2, 116, boxHeight, 4, MENU_SEL_BG);
+      canvas.drawRoundRect(6, yPos - 2, 116, boxHeight, 4, LIGHT_BLUE);
+      
+      canvas.setTextSize(1);
+      canvas.setTextColor(ST7735_WHITE);
+      canvas.setCursor(12, yPos + 3);
+      canvas.print("> ");
+      canvas.print(gamesList[idx]);
+    } else {
+      canvas.fillRoundRect(10, yPos, 108, 12, 3, MENU_BOX_BG);
+      canvas.setTextSize(1);
+      canvas.setTextColor(MENU_TEXT_DIM);
+      canvas.setCursor(14, yPos + 2);
+      canvas.print(gamesList[idx]);
+    }
+  }
+
+  // --- شريط التحكم السفلي (بدون أخضر) ---
+  canvas.drawFastHLine(4, 108, 120, PANEL_LINE);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(LIGHT_BLUE);
+  canvas.setCursor(6, 114);
+  canvas.print("B4:START");
+
+  canvas.setTextColor(DINO_RED);
+  canvas.setCursor(68, 114);
+  canvas.print("B5:WELCOME");
+}
+
+void drawGameMenu() {
+  drawGameMenuContent();
+  pushCanvas();
+}
+
+// =====================================================================
+// JOYSTICK TUTORIAL OVERLAY
+// =====================================================================
+void drawTransparentJoystickTutorial() {
+  drawGameMenuContent();
+
+  uint16_t* buf = canvas.getBuffer();
+  for (int i = 0; i < 128 * 128; i++) {
+    buf[i] = (buf[i] >> 1) & 0x39C4;
+  }
+
+  unsigned long t = millis() - tutorialAnimTimer;
+  float progress = (float)(t % 2000) / 2000.0;
+  int offsetY = (int)(sin(progress * 2.0 * M_PI) * 6.0);
+
+  int cx = 64;
+  int cy = 55;
+
+  canvas.fillRoundRect(10, 30, 108, 60, 8, PANEL_LINE);
+  canvas.drawRoundRect(10, 30, 108, 60, 8, ST7735_WHITE);
+
+  canvas.drawCircle(cx - 30, cy, 12, ST7735_WHITE);
+  canvas.drawCircle(cx - 30, cy, 6, ST7735_BLACK);
+  
+  int stickTopX = cx - 30;
+  int stickTopY = cy + offsetY - 5;
+  int stickBaseX = cx - 30;
+  int stickBaseY = cy + 5;
+  
+  canvas.drawLine(stickBaseX, stickBaseY, stickTopX, stickTopY, ST7735_WHITE);
+  canvas.fillCircle(stickTopX, stickTopY, 4, LIGHT_BLUE);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(cx - 8, cy - 8);
+  canvas.print("MOVE UP");
+  canvas.setCursor(cx - 8, cy + 4);
+  canvas.print("TO NAVIGATE");
+
+  pushCanvas();
+}
+
+void handleJoystickTutorialState() {
+  drawTransparentJoystickTutorial();
+
+  int yVal = analogRead(joyY);
+  bool joystickMoved = (yVal < 800 || yVal > 3200);
+
+  if (digitalRead(btn4) == LOW || joystickMoved) {
+    playBuzzer(2200, 80);
+    delay(100);
+
+    currentState = STATE_MENU;
+    currentGameIndex = 0;
+    menuVisualPos = 0.0;
+  }
+}
+
+void handleMenuState() {
+  if (focusAnimActive) {
+    unsigned long elapsed = millis() - focusAnimTimer;
+    if (elapsed < 250) {
+      focusProgress = (float)elapsed / 250.0;
+      drawGameMenu();
+    } else {
+      focusAnimActive = false;
+      currentState = STATE_GAME_INFO;
+      drawGameInfoScreen();
+    }
+    return;
+  }
+
+  int yVal = analogRead(joyY);
+  unsigned long now = millis();
+
+  if (now - lastNavTime > 180) {
+    bool navigated = true;
+
+    if (yVal < 1000) {
+      currentGameIndex--;
+      if (currentGameIndex < 0) currentGameIndex = totalGames - 1;
+    } else if (yVal > 3000) {
+      currentGameIndex++;
+      if (currentGameIndex >= totalGames) currentGameIndex = 0;
+    } else {
+      navigated = false;
+    }
+
+    if (navigated) {
+      playBuzzer(1500, 20);
+      lastNavTime = now;
+    }
+  }
+
+  drawGameMenu();
+
+  if (digitalRead(btn5) == LOW) {
+    playBuzzer(1000, 60);
+    delay(150);
+    currentState = STATE_WELCOME;
+    welcomeAnimTimer = millis();
+    waitingForButtonRelease = true;
+    welcomeSoundStep = 0;
+    return;
+  }
+
+  if (digitalRead(btn6) == LOW) {
+    playBuzzer(1800, 60);
+    focusAnimActive = true;
+    focusAnimTimer = millis();
+    focusProgress = 0.0;
+    return;
+  }
+
+  if (digitalRead(btn4) == LOW) {
+    digitalWrite(led1, HIGH);
+    digitalWrite(led2, HIGH);
+    playBuzzer(2200, 80);
+    delay(150);
+    digitalWrite(led1, LOW);
+    digitalWrite(led2, LOW);
+
+    if (currentGameIndex == 0) {
+      resetDinoGame();
+      currentState = STATE_DINO_START;
+      drawDinoStartScreen();
+    } else if (currentGameIndex == 1) {
+      resetFlappyGame();
+      currentState = STATE_FLAPPY_START;
+      drawFlappyStartScreen();
+    } else if (currentGameIndex == 2) {
+      resetTimeGame();
+      currentState = STATE_TIME_START;
+      drawTimeStartScreen();
+    } else {
+      resetDinoGame();
+      currentState = STATE_DINO_START;
+      drawDinoStartScreen();
+    }
+  }
+}
+
+// =====================================================================
+// GAME INFO SCREEN
+// =====================================================================
+void drawGameInfoScreen() {
+  canvas.fillScreen(DINO_BG);
+
+  canvas.drawRect(4, 4, 120, 120, LIGHT_BLUE);
+  canvas.drawRect(5, 5, 118, 118, LIGHT_BLUE);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_YELLOW);
+  canvas.setCursor(24, 12);
+  canvas.print("== GAME INFO ==");
+
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(12, 28);
+  canvas.print("Name: ");
+  canvas.setTextColor(LIGHT_BLUE);
+  canvas.print(gamesList[currentGameIndex]);
+
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(12, 44);
+  canvas.print("High Score: ");
+  canvas.setTextColor(ST7735_YELLOW);
+  int hs = 0;
+  if (currentGameIndex == 0) hs = dinoHighScore;
+  else if (currentGameIndex == 1) hs = flappyHighScore;
+  else if (currentGameIndex == 2) hs = timeGameHighScore;
+  canvas.print(hs);
+
+  canvas.drawFastHLine(12, 58, 104, PANEL_LINE);
+
+  canvas.setTextColor(ST7735_YELLOW);
+  canvas.setCursor(12, 68);
+  canvas.print("About:");
+
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(12, 82);
+  canvas.print(gamesDesc1[currentGameIndex]);
+
+  canvas.setCursor(12, 94);
+  canvas.print(gamesDesc2[currentGameIndex]);
+
+  canvas.setTextColor(DINO_RED);
+  canvas.setCursor(14, 110);
+  canvas.print("[B5] Back to Menu");
+
+  pushCanvas();
+}
+
+void handleGameInfoState() {
+  if (digitalRead(btn5) == LOW || digitalRead(btn4) == LOW || digitalRead(btn6) == LOW) {
+    playBuzzer(1200, 80);
+    currentState = STATE_MENU;
+    menuVisualPos = (float)currentGameIndex;
+    drawGameMenu();
+    delay(200);
+  }
+}
+
+// =====================================================================
+// COUNTDOWN & START SCREENS
+// =====================================================================
+void drawDinoStartScreen() {
+  canvas.fillScreen(DINO_BG);
+  drawDino(56, 35);
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(14, 65);
+  canvas.print("PRESS B4 BUTTON");
+  canvas.setCursor(38, 80);
+  canvas.print("TO START");
+  pushCanvas();
+}
+
+void handleDinoStartState() {
+  if (digitalRead(btn4) == LOW) {
+    playBuzzer(2000, 100);
+    delay(150);
+    countdownStep = 3;
+    countdownTimer = millis();
+    currentState = STATE_DINO_COUNTDOWN;
+    drawCountdownScreen(countdownStep);
+  } else if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    delay(150);
+    currentState = STATE_MENU;
+    menuVisualPos = (float)currentGameIndex;
+    drawGameMenu();
+  }
+}
+
+void drawFlappyStartScreen() {
+  canvas.fillScreen(0x02F5);
+
+  canvas.fillRect(15, 12, 16, 4, ST7735_WHITE);
+  canvas.fillRect(18, 9, 10, 3, ST7735_WHITE);
+  canvas.fillRect(90, 20, 20, 4, ST7735_WHITE);
+  canvas.fillRect(94, 16, 12, 4, ST7735_WHITE);
+  canvas.fillRect(45, 100, 18, 4, ST7735_WHITE);
+  canvas.fillRect(49, 97, 10, 3, ST7735_WHITE);
+
+  canvas.drawRect(13, 27, 102, 62, ST7735_WHITE);
+
+  canvas.setTextSize(2);
+  canvas.setCursor(28, 36);
+  canvas.setTextColor(ST7735_YELLOW);  canvas.print("F");
+  canvas.setTextColor(ST7735_MAGENTA); canvas.print("L");
+  canvas.setTextColor(LIGHT_BLUE);     canvas.print("A");
+  canvas.setTextColor(ST7735_WHITE);   canvas.print("P");
+  canvas.setTextColor(ST7735_RED);     canvas.print("P");
+  canvas.setTextColor(ST7735_YELLOW);  canvas.print("Y");
+
+  canvas.setCursor(40, 60);
+  canvas.setTextColor(ST7735_MAGENTA); canvas.print("B");
+  canvas.setTextColor(LIGHT_BLUE);     canvas.print("I");
+  canvas.setTextColor(ST7735_YELLOW);  canvas.print("R");
+  canvas.setTextColor(ST7735_WHITE);   canvas.print("D");
+
+  canvas.setTextSize(1);
+  canvas.fillRect(14, 103, 100, 16, DINO_BG);
+  canvas.drawRect(14, 103, 100, 16, ST7735_WHITE);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(18, 107);
+  canvas.print("PRESS B4 TO START");
+
+  pushCanvas();
+}
+
+void handleFlappyStartState() {
+  if (digitalRead(btn4) == LOW) {
+    playBuzzer(2000, 100);
+    delay(150);
+    countdownStep = 3;
+    countdownTimer = millis();
+    currentState = STATE_FLAPPY_COUNTDOWN;
+    drawCountdownScreen(countdownStep);
+  } else if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    delay(150);
+    currentState = STATE_MENU;
+    menuVisualPos = (float)currentGameIndex;
+    drawGameMenu();
+  }
+}
+
+void drawCountdownScreen(int num) {
+  canvas.fillScreen(DINO_BG);
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(32, 35);
+  canvas.print("GET READY!");
+  canvas.setTextSize(3);
+  canvas.setCursor(56, 65);
+  canvas.print(num);
+  pushCanvas();
+  playBuzzer(1200, 80);
+}
+
+void handleDinoCountdownState() {
+  if (millis() - countdownTimer >= 1000) {
+    countdownTimer = millis();
+    countdownStep--;
+    if (countdownStep > 0) {
+      drawCountdownScreen(countdownStep);
+    } else {
+      playBuzzer(2200, 150);
+      currentState = STATE_DINO_PLAYING;
+    }
+  }
+}
+
+void handleFlappyCountdownState() {
+  if (millis() - countdownTimer >= 1000) {
+    countdownTimer = millis();
+    countdownStep--;
+    if (countdownStep > 0) {
+      drawCountdownScreen(countdownStep);
+    } else {
+      playBuzzer(2200, 150);
+      currentState = STATE_FLAPPY_PLAYING;
+    }
+  }
+}
+
+// =====================================================================
+// RESET GAMES
+// =====================================================================
+void resetDinoGame() {
+  dinoX = 16;
+  dinoY = 85;
+  dinoVY = 0;
+  dinoIsJumping = false;
+  dinoScore = 0;
+  dinoGameSpeed = 2.0;
+
+  obstacles[0] = {140, 89, 8, 14, false, true};
+  obstacles[1] = {260, 87, 10, 16, false, true};
+}
+
+void resetFlappyGame() {
+  birdY = 64;
+  birdVY = 0;
+  flappyScore = 0;
+  pipeX = 128;
+  pipeGapY = random(35, 75);
+  flappySpeed = 1.4;
+}
+
+// =====================================================================
+// PLAYING STATES
+// =====================================================================
+void handleDinoPlayingState() {
+  if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    currentState = STATE_CONFIRM_EXIT;
+    exitChoice = false;
+    drawConfirmExitScreen();
+    delay(250);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastFrame < FRAME_TIME) return;
+  lastFrame = now;
+
+  int yVal = analogRead(joyY);
+  if ((digitalRead(btn4) == LOW || yVal < 1000) && !dinoIsJumping) {
+    dinoVY = -7.2;
+    dinoIsJumping = true;
+    playBuzzer(1800, 40);
+  }
+
+  dinoY += dinoVY;
+  dinoVY += 0.60;
+  if (dinoY >= 85) {
+    dinoY = 85;
+    dinoVY = 0;
+    dinoIsJumping = false;
+  }
+
+  for (int i = 0; i < NUM_OBS; i++) {
+    obstacles[i].x -= dinoGameSpeed;
+    if (obstacles[i].x < -15) {
+      obstacles[i].x = 140 + random(45, 95);
+      dinoScore += 10;
+
+      if (dinoScore >= 150 && random(0, 6) == 0) {
+        obstacles[i].isBird = true;
+        obstacles[i].w = 10;
+        obstacles[i].h = 8;
+        obstacles[i].y = 80;
+      } else {
+        obstacles[i].isBird = false;
+        obstacles[i].w = 8;
+        obstacles[i].h = random(12, 18);
+        obstacles[i].y = 99 - obstacles[i].h;
+      }
+
+      dinoGameSpeed = 2.0 + (dinoScore / 400.0);
+      if (dinoGameSpeed > 4.0) dinoGameSpeed = 4.0;
+    }
+
+    if (abs((int)dinoX - (int)obstacles[i].x) < 7 && abs((int)dinoY - obstacles[i].y) < 9) {
+      if (dinoScore > dinoHighScore) dinoHighScore = dinoScore;
+      triggerGameOver();
+      return;
+    }
+  }
+
+  drawDinoGame();
+}
+
+void handleFlappyPlayingState() {
+  if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    currentState = STATE_CONFIRM_EXIT;
+    exitChoice = false;
+    drawConfirmExitScreen();
+    delay(250);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastFrame < FRAME_TIME) return;
+  lastFrame = now;
+
+  if (digitalRead(btn4) == LOW) {
+    birdVY = -4.5;
+    playBuzzer(1600, 30);
+  }
+
+  birdY += birdVY;
+  birdVY += 0.45;
+
+  if (birdY < 2) {
+    birdY = 2;
+    birdVY = 0;
+  }
+  if (birdY > 115) {
+    if (flappyScore > flappyHighScore) flappyHighScore = flappyScore;
+    triggerGameOver();
+    return;
+  }
+
+  pipeX -= flappySpeed;
+  if (pipeX < -pipeWidth) {
+    pipeX = 128;
+    pipeGapY = random(35, 75);
+    flappyScore += 10;
+    flappySpeed = 1.4 + (flappyScore / 200.0);
+    if (flappySpeed > 2.6) flappySpeed = 2.6;
+  }
+
+  int birdX = 30;
+  if (birdX + 8 > pipeX && birdX < pipeX + pipeWidth) {
+    if (birdY < pipeGapY || birdY + 8 > pipeGapY + pipeGapHeight) {
+      if (flappyScore > flappyHighScore) flappyHighScore = flappyScore;
+      triggerGameOver();
+      return;
+    }
+  }
+
+  drawFlappyGame();
+}
+
+// =====================================================================
+// TIME GAME
+// =====================================================================
+void resetTimeGame() {
+  timeGameScore = 0;
+  timeRoundCount = 0;
+  timeCycleSeconds = 4.0;
+  startNewTimeRound();
+}
+
+void startNewTimeRound() {
+  timeTarget = random(100, 950) / 100.0;
+  timeRoundRunning = false;
+  timeShowingResult = false;
+  timeWaitingRelease = true;
+}
+
+void drawTimeStartScreen() {
+  canvas.fillScreen(DINO_BG);
+
+  canvas.drawCircle(64, 42, 22, LIGHT_BLUE);
+  canvas.drawFastVLine(64, 24, 16, ST7735_WHITE);
+  canvas.drawFastHLine(64, 42, 12, ST7735_WHITE);
+  canvas.fillCircle(64, 42, 2, LIGHT_BLUE);
+
+  canvas.setTextSize(2);
+  canvas.setTextColor(LIGHT_BLUE);
+  canvas.setCursor(14, 74);
+  canvas.print("TIME");
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(14, 92);
+  canvas.print("GAME");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(10, 112);
+  canvas.print("PRESS B4 TO START");
+
+  pushCanvas();
+}
+
+void handleTimeStartState() {
+  if (digitalRead(btn4) == LOW) {
+    playBuzzer(2000, 100);
+    delay(150);
+    currentState = STATE_TIME_PLAYING;
+  } else if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    delay(150);
+    currentState = STATE_MENU;
+    menuVisualPos = (float)currentGameIndex;
+    drawGameMenu();
+  }
+}
+
+void handleTimePlayingState() {
+  if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    currentState = STATE_CONFIRM_EXIT;
+    exitChoice = false;
+    drawConfirmExitScreen();
+    delay(250);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastFrame < FRAME_TIME) return;
+  lastFrame = now;
+
+  if (timeShowingResult) {
+    drawTimeGame(timeFrozenValue);
+    if (now - timeResultShownAt > 900) {
+      startNewTimeRound();
+    }
+    return;
+  }
+
+  if (!timeRoundRunning) {
+    if (timeWaitingRelease) {
+      if (digitalRead(btn4) == HIGH) timeWaitingRelease = false;
+      drawTimeGame(0.0);
+      return;
+    }
+    if (digitalRead(btn4) == LOW) {
+      playBuzzer(1800, 60);
+      timeRoundRunning = true;
+      timeRoundStart = millis();
+      timeWaitingRelease = true;
+      drawTimeGame(0.0);
+      return;
+    }
+    drawTimeGame(0.0);
+    return;
+  }
+
+  float elapsedSec = (now - timeRoundStart) / 1000.0;
+  float currentValue = fmod(elapsedSec * (10.0 / timeCycleSeconds), 10.0);
+
+  if (timeWaitingRelease) {
+    if (digitalRead(btn4) == HIGH) timeWaitingRelease = false;
+    drawTimeGame(currentValue);
+    return;
+  }
+
+  if (digitalRead(btn4) == LOW) {
+    float diff = fabs(currentValue - timeTarget);
+    if (diff > 2.0) diff = 2.0;
+    int roundScore = (int)(1000.0 * (1.0 - diff / 2.0));
+    if (roundScore < 0) roundScore = 0;
+
+    timeGameScore += roundScore;
+    if (timeGameScore > timeGameHighScore) timeGameHighScore = timeGameScore;
+
+    timeLastDiff = diff;
+    timeLastScore = roundScore;
+    timeFrozenValue = currentValue;
+    timeShowingResult = true;
+    timeResultShownAt = now;
+    timeRoundRunning = false;
+
+    if (diff < 0.03) { strcpy(timeResultText, "PERFECT!"); playBuzzer(3000, 120); }
+    else if (diff < 0.10) { strcpy(timeResultText, "GREAT!"); playBuzzer(2200, 90); }
+    else if (diff < 0.30) { strcpy(timeResultText, "GOOD"); playBuzzer(1600, 70); }
+    else if (diff < 0.60) { strcpy(timeResultText, "OK"); playBuzzer(1000, 60); }
+    else { strcpy(timeResultText, "MISS"); playBuzzer(300, 100); }
+
+    timeRoundCount++;
+    timeCycleSeconds = 4.0 - (timeRoundCount * 0.15);
+    if (timeCycleSeconds < 1.8) timeCycleSeconds = 1.8;
+
+    drawTimeGame(timeFrozenValue);
+    return;
+  }
+
+  drawTimeGame(currentValue);
+}
+
+void drawTimeGame(float currentValue) {
+  canvas.fillScreen(DINO_BG);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(4, 4);
+  canvas.print("SC:");
+  canvas.print(timeGameScore);
+
+  canvas.setCursor(75, 4);
+  canvas.print("HI:");
+  canvas.print(timeGameHighScore);
+
+  char tbuf[8];
+  dtostrf(timeTarget, 4, 2, tbuf);
+  canvas.setTextColor(LIGHT_BLUE);
+  canvas.setCursor(28, 18);
+  canvas.print("TARGET ");
+  canvas.print(tbuf);
+
+  float liveDiff = fabs(currentValue - timeTarget);
+  uint16_t numColor = ST7735_WHITE;
+  if (!timeShowingResult && timeRoundRunning && liveDiff < 0.3) {
+    numColor = LIGHT_BLUE;
+  }
+
+  char vbuf[8];
+  dtostrf(currentValue, 4, 2, vbuf);
+  canvas.setTextSize(3);
+  canvas.setTextColor(numColor);
+  canvas.setCursor(20, 42);
+  canvas.print(vbuf);
+
+  int barX = 8, barY = 88, barW = 112, barH = 10;
+  canvas.drawRect(barX, barY, barW, barH, ST7735_WHITE);
+  int fillW = (int)((currentValue / 10.0) * (barW - 2));
+  if (fillW < 0) fillW = 0;
+  canvas.fillRect(barX + 1, barY + 1, fillW, barH - 2, LIGHT_BLUE);
+
+  int tickX = barX + (int)((timeTarget / 10.0) * barW);
+  canvas.drawFastVLine(tickX, barY - 3, barH + 6, ST7735_WHITE);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(ST7735_WHITE);
+  canvas.setCursor(6, 116);
+  if (timeShowingResult) {
+    canvas.print("GET READY...");
+  } else if (!timeRoundRunning) {
+    canvas.print("PRESS B4 TO START");
+  } else {
+    canvas.print("B4:STOP  B5:EXIT");
+  }
+
+  if (timeShowingResult) {
+    canvas.fillRoundRect(14, 55, 100, 24, 4, DINO_BG);
+    canvas.drawRoundRect(14, 55, 100, 24, 4, LIGHT_BLUE);
+    canvas.setTextColor(ST7735_WHITE);
+    canvas.setTextSize(1);
+    canvas.setCursor(20, 60);
+    canvas.print(timeResultText);
+    canvas.setCursor(20, 70);
+    canvas.print("+");
+    canvas.print(timeLastScore);
+  }
+
+  pushCanvas();
+}
+
+// =====================================================================
+// DRAWING FUNCTIONS
+// =====================================================================
+void drawDinoGame() {
+  canvas.fillScreen(DINO_BG);
+
+  for (int i = 0; i < 3; i++) {
+    canvas.fillRect(clouds[i].x, clouds[i].y, 12, 3, DINO_FG);
+    clouds[i].x--;
+    if (clouds[i].x < -15) clouds[i].x = 130;
+  }
+
+  canvas.drawFastHLine(0, 99, 128, DINO_FG);
+
+  for (int i = 0; i < NUM_OBS; i++) {
+    if (obstacles[i].x > -10 && obstacles[i].x < 135) {
+      if (obstacles[i].isBird) {
+        drawBird((int)obstacles[i].x, obstacles[i].y);
+      } else {
+        drawCactus((int)obstacles[i].x, obstacles[i].y, obstacles[i].w, obstacles[i].h);
+      }
+    }
+  }
+
+  drawDino((int)dinoX, (int)dinoY);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(4, 4);
+  canvas.print("SC:");
+  canvas.print(dinoScore);
+
+  canvas.setCursor(75, 4);
+  canvas.print("HI:");
+  canvas.print(dinoHighScore);
+
+  pushCanvas();
+}
+
+void drawFlappyGame() {
+  canvas.fillScreen(DINO_BG);
+
+  canvas.fillRect((int)pipeX, 0, pipeWidth, pipeGapY, DINO_FG);
+  canvas.fillRect((int)pipeX - 2, pipeGapY - 4, pipeWidth + 4, 4, DINO_FG);
+
+  int bottomPipeY = pipeGapY + pipeGapHeight;
+  canvas.fillRect((int)pipeX, bottomPipeY, pipeWidth, 128 - bottomPipeY, DINO_FG);
+  canvas.fillRect((int)pipeX - 2, bottomPipeY, pipeWidth + 4, 4, DINO_FG);
+
+  drawFlappyBird(30, (int)birdY);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(4, 4);
+  canvas.print("SC:");
+  canvas.print(flappyScore);
+
+  canvas.setCursor(75, 4);
+  canvas.print("HI:");
+  canvas.print(flappyHighScore);
+
+  pushCanvas();
+}
+
+void drawDino(int x, int y) {
+  canvas.fillRect(x + 4, y + 4, 8, 8, DINO_FG);
+  canvas.fillRect(x + 8, y, 6, 6, DINO_FG);
+  canvas.fillRect(x + 12, y + 1, 2, 2, DINO_BG);
+  canvas.fillRect(x + 3, y + 12, 2, 4, DINO_FG);
+  canvas.fillRect(x + 9, y + 12, 2, 4, DINO_FG);
+  canvas.fillRect(x, y + 6, 4, 2, DINO_FG);
+}
+
+void drawFlappyBird(int x, int y) {
+  canvas.fillRect(x, y + 2, 8, 6, DINO_FG);
+  canvas.fillRect(x + 6, y + 1, 3, 3, DINO_FG);
+  canvas.fillRect(x + 7, y + 2, 1, 1, DINO_BG);
+  canvas.fillRect(x + 8, y + 3, 3, 2, DINO_RED);
+  canvas.fillRect(x + 2, y, 3, 2, DINO_FG);
+}
+
+void drawCactus(int x, int y, int w, int h) {
+  canvas.fillRect(x, y, w, h, DINO_FG);
+  canvas.fillRect(x - 2, y + 4, 2, 5, DINO_FG);
+  canvas.fillRect(x + w, y + 2, 2, 5, DINO_FG);
+}
+
+void drawBird(int x, int y) {
+  canvas.fillRect(x + 2, y + 2, 6, 4, DINO_FG);
+  canvas.fillRect(x, y, 4, 2, DINO_FG);
+  canvas.fillRect(x + 6, y + 4, 4, 2, DINO_FG);
+}
+
+// =====================================================================
+// GAME OVER & EXIT
+// =====================================================================
+void triggerGameOver() {
+  playBuzzer(300, 150);
+  digitalWrite(led1, HIGH);
+  digitalWrite(led2, HIGH);
+  delay(150);
+  digitalWrite(led1, LOW);
+  digitalWrite(led2, LOW);
+
+  currentState = STATE_GAMEOVER;
+  drawGameOverScreen();
+}
+
+void drawGameOverScreen() {
+  canvas.fillScreen(DINO_BG);
+  canvas.drawRect(7, 14, 114, 99, DINO_RED);
+
+  canvas.setTextSize(2);
+  canvas.setTextColor(DINO_RED);
+  canvas.setCursor(15, 27);
+  canvas.print("GAME");
+  canvas.setCursor(15, 47);
+  canvas.print("OVER");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(18, 70);
+  canvas.print("SCORE: ");
+  canvas.print((currentGameIndex == 0) ? dinoScore : flappyScore);
+
+  canvas.setTextColor(DINO_RED);
+  canvas.setCursor(18, 88);
+  canvas.print("B6: PLAY AGAIN");
+
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(18, 101);
+  canvas.print("B5: EXIT");
+
+  pushCanvas();
+}
+
+void handleGameOverState() {
+  if (digitalRead(btn6) == LOW) {
+    playBuzzer(2200, 100);
+    delay(150);
+    countdownStep = 3;
+    countdownTimer = millis();
+
+    if (currentGameIndex == 0) {
+      resetDinoGame();
+      currentState = STATE_DINO_COUNTDOWN;
+    } else {
+      resetFlappyGame();
+      currentState = STATE_FLAPPY_COUNTDOWN;
+    }
+    drawCountdownScreen(countdownStep);
+  } else if (digitalRead(btn5) == LOW) {
+    playBuzzer(1200, 100);
+    delay(150);
+    currentState = STATE_MENU;
+    menuVisualPos = (float)currentGameIndex;
+    drawGameMenu();
+  }
+}
+
+void drawConfirmExitScreen() {
+  canvas.fillScreen(DINO_BG);
+  canvas.drawRect(8, 18, 112, 86, DINO_FG);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(DINO_FG);
+  canvas.setCursor(32, 29);
+  canvas.print("EXIT GAME?");
+
+  canvas.setCursor(29, 45);
+  canvas.print("Are you sure?");
+
+  drawChoiceButton(17, 67, "STAY", !exitChoice);
+  drawChoiceButton(68, 67, "EXIT", exitChoice);
+
+  pushCanvas();
+}
+
+void drawChoiceButton(int x, int y, const char* label, bool selected) {
+  if (selected) {
+    canvas.fillRect(x, y, 43, 21, DINO_FG);
+    canvas.setTextColor(DINO_BG);
+    canvas.drawRect(x, y, 43, 21, DINO_FG);
+  } else {
+    canvas.fillRect(x, y, 43, 21, DINO_BG);
+    canvas.setTextColor(DINO_FG);
+    canvas.drawRect(x, y, 43, 21, DINO_FG);
+  }
+  canvas.setCursor(x + 8, y + 7);
+  canvas.print(label);
+}
+
+void handleConfirmExitState() {
+  int xVal = analogRead(joyX);
+
+  if (xVal < 1000) {
+    exitChoice = false;
+    playBuzzer(1500, 30);
+    drawConfirmExitScreen();
+    delay(180);
+  } else if (xVal > 3000) {
+    exitChoice = true;
+    playBuzzer(1500, 30);
+    drawConfirmExitScreen();
+    delay(180);
+  }
+
+  if (digitalRead(btn4) == LOW) {
+    playBuzzer(2000, 100);
+    delay(150);
+
+    if (exitChoice) {
+      currentState = STATE_MENU;
+      menuVisualPos = (float)currentGameIndex;
+      drawGameMenu();
+    } else {
+      if (currentGameIndex == 0) {
+        currentState = STATE_DINO_PLAYING;
+      } else if (currentGameIndex == 1) {
+        currentState = STATE_FLAPPY_PLAYING;
+      } else if (currentGameIndex == 2) {
+        currentState = STATE_TIME_PLAYING;
+      }
+    }
+  }
+}
